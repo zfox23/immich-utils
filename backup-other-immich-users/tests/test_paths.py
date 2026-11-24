@@ -103,6 +103,28 @@ class GoneTests(unittest.TestCase):
         self.assertEqual(b.find_gone_assets(assets, set(), set()), [])
 
 
+class SpaceTests(unittest.TestCase):
+    def test_asset_size(self):
+        self.assertEqual(b.asset_size({"exifInfo": {"fileSizeInByte": 1234}}), 1234)
+        self.assertIsNone(b.asset_size({"exifInfo": {}}))
+        self.assertIsNone(b.asset_size({"exifInfo": None}))
+        self.assertIsNone(b.asset_size({}))
+        self.assertIsNone(b.asset_size({"exifInfo": {"fileSizeInByte": True}}))
+
+    def test_space_needed(self):
+        result = b.space_needed([
+            ("Jane", None, None),          # user with nothing to do still gets a row
+            ("Bob", None, None),
+            ("Jane", "download", 100),
+            ("Jane", "replace", 50),
+            ("Jane", "download", None),    # unknown size
+            ("Jane", "none", 999),         # already backed up: free
+            ("Jane", "move", 999),         # moves don't need space
+            ("Jane", "adopt", 999),
+        ])
+        self.assertEqual(result, {"Jane": [3, 150, 1], "Bob": [0, 0, 0]})
+
+
 class ReportTests(unittest.TestCase):
     def _data(self, html_text):
         m = re.search(r'<script type="application/json" id="report-data">(.*?)</script>', html_text, re.S)

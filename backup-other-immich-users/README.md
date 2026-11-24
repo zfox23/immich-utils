@@ -61,7 +61,7 @@ You can also use environment variables (`IMMICH_URL`, `IMMICH_API_KEY`, `IMMICH_
 
 ```sh
 python backup_immich_users.py --probe     # checks the key's permissions and partner access; changes nothing
-python backup_immich_users.py --dry-run   # shows what would be downloaded, moved or deleted
+python backup_immich_users.py --dry-run   # shows what would be downloaded, moved or deleted, and the disk space needed
 python backup_immich_users.py             # do it
 ```
 
@@ -81,6 +81,16 @@ Exit codes: `0` success, `1` finished but some assets failed (run again to retry
 
 1. Lists the people sharing with you, and warns about anyone who isn't (if the key has `adminUser.read`).
 2. Lists every asset on their timelines, including every photo in a stack and each Live Photo's video clip.
+   Then it prints how much disk space the new and changed files need, per person and in total, alongside the free space on the backup disk:
+   ```
+   Disk space this run will use (new and changed files):
+     User        Files        Size
+     Bob             1     49.6 MB
+     Jane Doe        3     10.0 MB
+     Total           4     59.6 MB
+     Free on backup disk: 1.1 TB
+   ```
+   Sizes come from Immich's file info. Assets Immich hasn't read yet are counted as "of unknown size". A real run warns before starting if there isn't room.
 3. Downloads new assets. Each download is written to a temporary `.part` file and checked against Immich's SHA-1 checksum before being moved into place, and the file's modified time is set to when it was captured. Ctrl+C is safe; the next run continues where it stopped.
 4. Keeps the backup in step with the server:
    - **Date changed in Immich**: the file moves to its new date folder.

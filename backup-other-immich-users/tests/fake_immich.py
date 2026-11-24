@@ -64,6 +64,7 @@ class FakeImmich:
             "localDateTime": a["localDateTime"], "fileCreatedAt": a["fileCreatedAt"], "checksum": checksum,
             "livePhotoVideoId": a["livePhotoVideoId"], "visibility": a["visibility"], "isTrashed": a["trashed"],
             "type": "IMAGE", "libraryId": a["libraryId"],
+            "exifInfo": {} if a.get("no_size") else {"fileSizeInByte": len(a["content"])},
         }
 
     def can_read_asset(self, a):

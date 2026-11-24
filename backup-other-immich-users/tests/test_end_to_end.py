@@ -160,6 +160,31 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.run_backup("--dry-run"), 0)
         self.assertFalse(self.root.exists())
 
+    def test_dry_run_reports_space_needed(self):
+        import contextlib
+        import io
+        import re
+        f = self.fake
+        f.set_content(self.b1, b"x" * 2048)
+        f.assets[self.jlib]["no_size"] = True
+        jane_known = sum(len(f.assets[a]["content"]) for a in (self.j1, self.j2, self.jvid, self.jlive))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.run_backup("--dry-run"), 0)
+        text = out.getvalue()
+        self.assertRegex(text, r"Bob\s+1\s+2\.0 KB")
+        self.assertRegex(text, r"Jane Doe\s+5\s+%s\s+\(\+1 of unknown size\)" % re.escape(b.fmt_bytes(jane_known)))
+        self.assertRegex(text, r"Total\s+6\s+%s\s+\(\+1 of unknown size\)" % re.escape(b.fmt_bytes(jane_known + 2048)))
+        self.assertIn("Free on backup disk:", text)
+        self.assertIn("[2.0 KB]", text)  # per-file size in the dry-run list
+
+        # After a real run, nothing more is needed.
+        self.assertEqual(self.run_backup("--non-interactive"), 0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.run_backup("--dry-run"), 0)
+        self.assertRegex(out.getvalue(), r"Total\s+0\s+0 B")
+
     def test_user_filter(self):
         self.assertEqual(self.run_backup("--non-interactive", "--user", "bob"), 0)
         self.assertEqual(self.files(), {"Bob/2024/2024-12-31/_CON.jpg"})

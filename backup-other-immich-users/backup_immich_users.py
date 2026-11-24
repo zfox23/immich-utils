@@ -166,6 +166,45 @@ def find_gone_assets(
     return sorted(gone, key=lambda a: (manifest_assets[a].get("relPath") or "").casefold())
 
 
+DOWNLOAD_KINDS = ("download", "restore", "replace", "move+replace")
+
+
+def asset_size(detail: Dict[str, Any]) -> Optional[int]:
+    """Original file size from Immich's asset details (exifInfo.fileSizeInByte), if known."""
+    value = (detail.get("exifInfo") or {}).get("fileSizeInByte")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+        return int(value)
+    return None
+
+
+def space_needed(items: Iterable[Tuple[str, Optional[str], Optional[int]]]) -> Dict[str, List[int]]:
+    """Sum download sizes per user. `items` are (user name, action kind, size or None).
+    Returns {user: [files, known bytes, files of unknown size]}. Kinds that don't download
+    (existing, move, adopt, or None) count as zero, but the user still gets a row."""
+    out: Dict[str, List[int]] = {}
+    for name, kind, size in items:
+        row = out.setdefault(name, [0, 0, 0])
+        if kind not in DOWNLOAD_KINDS:
+            continue
+        row[0] += 1
+        if size is None:
+            row[2] += 1
+        else:
+            row[1] += size
+    return out
+
+
+def free_space(path: Path) -> Optional[int]:
+    """Free bytes on the disk holding `path` (or its nearest existing parent)."""
+    p = path
+    while not p.exists() and p.parent != p:
+        p = p.parent
+    try:
+        return shutil.disk_usage(to_fs(p)).free
+    except OSError:
+        return None
+
+
 def to_fs(path: Path) -> str:
     """Return a filesystem path string, using the Windows long-path prefix when needed."""
     s = os.path.abspath(str(path))
@@ -656,16 +695,6 @@ class Backup:
             self.users = selected
             log.info("Limiting this run to: %s", ", ".join(u.name for u in selected.values()))
 
-        if admin_users is not None:
-            usage = sum((next((u for u in admin_users if u["id"] == uid), {}) or {}).get("quotaUsageInBytes") or 0 for uid in self.users)
-            if usage and not self.args.dry_run:
-                try:
-                    free = shutil.disk_usage(to_fs(self.root)).free
-                    if usage > free:
-                        self.warn("These users use %s on the server but only %s is free here. The backup will stop when the disk is nearly full.", fmt_bytes(usage), fmt_bytes(free))
-                except OSError:
-                    pass
-
     def gather(self) -> Dict[str, Tuple[UserInfo, Dict[str, Any], Optional[str]]]:
         """Returns {asset_id: (owner, detail, live_photo_still_id)} for all reachable assets."""
         found: Dict[str, Tuple[UserInfo, Dict[str, Any], Optional[str]]] = {}
@@ -874,20 +903,52 @@ class Backup:
         act.status = ST_RESTORED if act.kind == "restore" else ST_NEW
         log.info("%s %s (%s)", "RESTORED " if act.kind == "restore" else "DOWNLOADED", name, fmt_bytes(size))
 
+    def log_space_needed(self) -> Tuple[int, Optional[int]]:
+        """Log per-user and total download sizes plus free space. Returns (known bytes, free)."""
+        per_user = space_needed(
+            [(u.name, None, None) for u in self.users.values()]
+            + [(a.owner.name, a.kind, asset_size(a.detail)) for a in self.actions]
+        )
+        width = max([len("Total")] + [len(n) for n in per_user])
+        log.info("")
+        log.info("Disk space this run will use (new and changed files):")
+        log.info("  %-*s  %7s  %10s", width, "User", "Files", "Size")
+        tot_files = tot_bytes = tot_unknown = 0
+        for name in sorted(per_user, key=str.casefold):
+            files, size, unknown = per_user[name]
+            tot_files, tot_bytes, tot_unknown = tot_files + files, tot_bytes + size, tot_unknown + unknown
+            log.info("  %-*s  %7d  %10s%s", width, name, files, fmt_bytes(size), f"  (+{unknown} of unknown size)" if unknown else "")
+        log.info("  %-*s  %7d  %10s%s", width, "Total", tot_files, fmt_bytes(tot_bytes), f"  (+{tot_unknown} of unknown size)" if tot_unknown else "")
+        free = free_space(self.root)
+        if free is not None:
+            log.info("  Free on backup disk: %s", fmt_bytes(free))
+        log.info("")
+        return tot_bytes, free
+
     def execute(self) -> None:
         todo = [a for a in self.actions if a.kind != "none"]
         for a in self.actions:
             if a.kind == "none":
                 a.status = ST_EXISTING
-        n_dl = sum(1 for a in todo if a.kind in ("download", "restore", "replace", "move+replace"))
+        n_dl = sum(1 for a in todo if a.kind in DOWNLOAD_KINDS)
         log.info("Plan: %d to download, %d to move, %d to adopt, %d already backed up.",
                  n_dl, sum(1 for a in todo if a.kind == "move"), sum(1 for a in todo if a.kind == "adopt"),
                  len(self.actions) - len(todo))
         if self.args.dry_run:
             for a in todo:
                 extra = f" (from {a.old_rel_path})" if a.old_rel_path else ""
-                log.info("[dry-run] %-12s %s: %s%s", a.kind, a.owner.name, a.rel_path, extra)
+                size = f" [{fmt_bytes(asset_size(a.detail))}]" if a.kind in DOWNLOAD_KINDS else ""
+                log.info("[dry-run] %-12s %s: %s%s%s", a.kind, a.owner.name, a.rel_path, size, extra)
+            needed, free = self.log_space_needed()
+            if free is not None and needed > free - MIN_FREE_BYTES:
+                self.warn("Not enough free space: the real run needs %s but only %s is free (and keeps %s spare).",
+                          fmt_bytes(needed), fmt_bytes(free), fmt_bytes(MIN_FREE_BYTES))
             return
+
+        needed, free = self.log_space_needed()
+        if free is not None and needed > free - MIN_FREE_BYTES:
+            self.warn("This run needs %s but only %s is free; downloads will stop when less than %s is left.",
+                      fmt_bytes(needed), fmt_bytes(free), fmt_bytes(MIN_FREE_BYTES))
 
         # Moves/adopts are quick and touch shared paths: do them serially first.
         serial = [a for a in todo if a.kind in ("move", "adopt", "move+replace")]
@@ -1493,8 +1554,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
             except Exception as e:  # never let reporting hide the real outcome
                 log.error("Could not write manifest/report: %s", e)
             lock.release()
-        elif args.dry_run:
-            backup.summary()
+        elif args.dry_run and backup.warnings:
+            log.info("%d warning(s); see above.", len(backup.warnings))
     return code
 
 
