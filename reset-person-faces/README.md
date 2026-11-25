@@ -9,9 +9,16 @@ When Immich keeps mixing up two people who look alike, this script lets you give
 
 It needs Python 3.9+, the repo's `shared/` folder (so keep it inside the repo), and `questionary`. It was written against Immich 3.4.
 
+On systems where the system Python is "externally managed" (Debian/Ubuntu and others refuse a plain `pip install`), install into a virtual environment at the repo root:
+
 ```sh
-pip install -r requirements.txt
+cd /path/to/immich-utils
+python3 -m venv .venv                      # Debian/Ubuntu: sudo apt install python3-venv if this fails
+.venv/bin/pip install -r reset-person-faces/requirements.txt
+.venv/bin/python reset-person-faces/reset_person_faces.py --dry-run
 ```
+
+On Windows, use `.venv\Scripts\pip` and `.venv\Scripts\python`. You can also `source .venv/bin/activate` once per shell and then use plain `python`. `.venv/` is ignored by git.
 
 ## Why not just run "Face Detection → Missing"?
 
@@ -49,7 +56,7 @@ Without `queue.read`, the script asks you to watch *Administration → Jobs* and
 ## Running it
 
 ```sh
-python reset_person_faces.py --dry-run
+python reset_person_faces.py --dry-run     # with the venv activated, or use ../.venv/bin/python
 python reset_person_faces.py
 ```
 
