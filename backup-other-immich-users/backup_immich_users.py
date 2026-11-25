@@ -26,16 +26,18 @@ import posixpath
 import re
 import shutil
 import socket
-import ssl
 import sys
 import threading
 import time
 import urllib.error
-import urllib.parse
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for the shared package
+from shared import config as shared_config  # noqa: E402
+from shared.config import ConfigError  # noqa: E402
+from shared.immich_client import STOP, Cancelled, ImmichClient, ImmichHTTPError, http_error_hint  # noqa: E402
 
 __version__ = "1.0.0"
 
@@ -46,7 +48,6 @@ MANIFEST_VERSION = 1
 REPORTS_TO_KEEP = 10
 MIN_FREE_BYTES = 1024 ** 3  # stop downloading when less than 1 GiB is free
 CHUNK_SIZE = 1024 * 1024
-RETRY_BASE_DELAY = 2.0  # seconds; doubles on each retry
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})")
 
@@ -218,128 +219,25 @@ def to_fs(path: Path) -> str:
 # --------------------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------------------
-class ConfigError(Exception):
-    pass
-
-
 def load_config(args: argparse.Namespace) -> Dict[str, Any]:
-    cfg: Dict[str, Any] = {}
-    config_path = Path(args.config) if args.config else SCRIPT_DIR / "config.json"
-    if config_path.exists():
-        try:
-            cfg.update(json.loads(config_path.read_text(encoding="utf-8")))
-        except json.JSONDecodeError as e:
-            raise ConfigError(f"{config_path} is not valid JSON: {e}")
-    elif args.config:
-        raise ConfigError(f"Config file not found: {config_path}")
-
-    env_map = {"server_url": "IMMICH_URL", "api_key": "IMMICH_API_KEY", "backup_root": "IMMICH_BACKUP_ROOT"}
-    for key, env in env_map.items():
-        if os.environ.get(env):
-            cfg[key] = os.environ[env]
-    for key in env_map:
-        value = getattr(args, key, None)
-        if value:
-            cfg[key] = value
-
-    missing = [k for k in ("server_url", "api_key") if not cfg.get(k)]
-    if not args.probe and not cfg.get("backup_root"):
-        missing.append("backup_root")
-    if missing:
-        raise ConfigError(
-            "Missing setting(s): " + ", ".join(missing) + ". Set them in config.json "
-            "(see config.example.json), via environment variables, or on the command line."
-        )
-
-    url = str(cfg["server_url"]).strip().rstrip("/")
-    if url.endswith("/api"):
-        url = url[:-4]
-    if not url.startswith(("http://", "https://")):
-        raise ConfigError(f"server_url must start with http:// or https:// (got {url!r})")
-    cfg["server_url"] = url
+    cli = {"server_url": args.server_url, "api_key": args.api_key, "backup_root": args.backup_root}
+    required = ("server_url", "api_key") if args.probe else ("server_url", "api_key", "backup_root")
+    cfg = shared_config.load_config(
+        SCRIPT_DIR, args.config, cli, required=required, extra_env={"backup_root": "IMMICH_BACKUP_ROOT"}
+    )
     if cfg.get("backup_root"):
         cfg["backup_root"] = Path(os.path.expanduser(str(cfg["backup_root"]))).resolve()
     return cfg
 
 
 # --------------------------------------------------------------------------------------
-# HTTP client
+# HTTP client (the generic parts live in shared/immich_client.py)
 # --------------------------------------------------------------------------------------
-class ImmichHTTPError(Exception):
-    def __init__(self, status: int, method: str, path: str, body: str):
-        super().__init__(f"HTTP {status} for {method} {path}: {body[:300]}")
-        self.status = status
-
-
-class Cancelled(Exception):
-    pass
-
-
-STOP = threading.Event()
-
-
-class ImmichClient:
-    def __init__(self, base_url: str, api_key: str, insecure: bool = False, timeout: float = 60.0, retries: int = 3):
-        self.base_url = base_url
-        self.api_key = api_key
-        self.timeout = timeout
-        self.retries = retries
-        ctx = ssl.create_default_context()
-        if insecure:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-        self._opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
-
-    def _url(self, path: str, params: Optional[Dict[str, Any]] = None) -> str:
-        url = f"{self.base_url}/api{path}"
-        if params:
-            clean = {k: (str(v).lower() if isinstance(v, bool) else v) for k, v in params.items() if v is not None}
-            url += "?" + urllib.parse.urlencode(clean)
-        return url
-
-    def _open(self, method: str, path: str, params=None, body=None):
-        data = json.dumps(body).encode("utf-8") if body is not None else None
-        req = urllib.request.Request(self._url(path, params), data=data, method=method)
-        req.add_header("x-api-key", self.api_key)
-        req.add_header("Accept", "application/json")
-        req.add_header("User-Agent", f"immich-backup-other-users/{__version__}")
-        if data is not None:
-            req.add_header("Content-Type", "application/json")
-        return self._opener.open(req, timeout=self.timeout)
-
-    def _with_retries(self, method: str, path: str, fn: Callable[[], Any]) -> Any:
-        delay = RETRY_BASE_DELAY
-        for attempt in range(self.retries + 1):
-            if STOP.is_set():
-                raise Cancelled()
-            try:
-                return fn()
-            except urllib.error.HTTPError as e:
-                body = ""
-                try:
-                    body = e.read().decode("utf-8", "replace")
-                except Exception:
-                    pass
-                retryable = e.code == 429 or e.code >= 500
-                if not retryable or attempt == self.retries:
-                    raise ImmichHTTPError(e.code, method, path, body) from None
-                log.debug("HTTP %s for %s %s, retrying in %.0fs", e.code, method, path, delay)
-            except (urllib.error.URLError, socket.timeout, ConnectionError, TimeoutError, OSError) as e:
-                if isinstance(e, Cancelled):
-                    raise
-                if attempt == self.retries:
-                    raise
-                log.debug("Network error for %s %s (%s), retrying in %.0fs", method, path, e, delay)
-            STOP.wait(delay)
-            delay *= 2
-        raise AssertionError("unreachable")
-
-    def get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        def do():
-            with self._open("GET", path, params) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-
-        return self._with_retries("GET", path, do)
+class BackupClient(ImmichClient):
+    def __init__(self, base_url: str, api_key: str, insecure: bool = False):
+        super().__init__(
+            base_url, api_key, insecure=insecure, user_agent=f"immich-backup-other-users/{__version__}", logger=log
+        )
 
     def download_original(self, asset_id: str, dest: Path) -> Tuple[int, str]:
         """Stream an asset's original file to `dest`. Returns (bytes, base64 sha1)."""
@@ -514,7 +412,7 @@ def fmt_bytes(n: Optional[int]) -> str:
     return f"{n} B"
 
 
-def enumerate_partner(client: ImmichClient, user: UserInfo) -> List[str]:
+def enumerate_partner(client: BackupClient, user: UserInfo) -> List[str]:
     """Return ids of the partner's non-trashed timeline assets (all stack members)."""
     params = {"userId": user.id, "visibility": "timeline"}
     buckets = client.get_json("/timeline/buckets", params)
@@ -530,7 +428,7 @@ def enumerate_partner(client: ImmichClient, user: UserInfo) -> List[str]:
 
 
 def fetch_details(
-    client: ImmichClient, ids: Iterable[str], workers: int, label: str
+    client: BackupClient, ids: Iterable[str], workers: int, label: str
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
     """GET /assets/{id} for each id concurrently. Returns (details, errors)."""
     ids = list(dict.fromkeys(ids))
@@ -583,7 +481,7 @@ class Action:
 
 
 class Backup:
-    def __init__(self, cfg: Dict[str, Any], args: argparse.Namespace, client: ImmichClient):
+    def __init__(self, cfg: Dict[str, Any], args: argparse.Namespace, client: BackupClient):
         self.cfg = cfg
         self.args = args
         self.client = client
@@ -1385,7 +1283,7 @@ def render_report(meta: Dict[str, Any], rows: List[Dict[str, Any]], report_dir_r
 # --------------------------------------------------------------------------------------
 # Probe
 # --------------------------------------------------------------------------------------
-def run_probe(client: ImmichClient) -> int:
+def run_probe(client: BackupClient) -> int:
     ok = True
 
     def check(label: str, fn: Callable[[], Any]) -> Any:
@@ -1505,7 +1403,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
     except ConfigError as e:
         print(f"Configuration error: {e}", file=sys.stderr)
         return 2
-    client = ImmichClient(cfg["server_url"], cfg["api_key"], insecure=args.insecure)
+    client = BackupClient(cfg["server_url"], cfg["api_key"], insecure=args.insecure)
 
     if args.probe:
         setup_logging(None, "", args.verbose)
@@ -1538,7 +1436,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
         log.error("Interrupted. Progress so far has been saved; run again to continue.")
         code = 130
     except ImmichHTTPError as e:
-        hint = " Check the API key and its permissions (run with --probe)." if e.status in (401, 403) else ""
+        hint = " Check the API key and its permissions (run with --probe)." if http_error_hint(e) else ""
         log.error("Server error: %s%s", e, hint)
         code = 2
     except (urllib.error.URLError, OSError, RuntimeError) as e:

@@ -16,7 +16,7 @@ This script copies the original photos and videos that **other people** uploaded
   .immich-backup/                  <- manifest, logs, past reports (don't edit)
 ```
 
-It needs Python 3.9 or newer and nothing else. It runs on Windows, macOS and Linux, and was tested against Immich 3.4.2.
+It needs Python 3.9 or newer and the repo's `shared/` folder, so keep it inside the repo. It runs on Windows, macOS and Linux, and was tested against Immich 3.4.2.
 
 ## How access works
 
@@ -45,17 +45,28 @@ A key with only these permissions is safer than one with `all`.
 
 ### 3. Configure
 
-Copy `config.example.json` to `config.json` in this folder and fill it in. `config.json` is ignored by git.
+Settings live in two files, both ignored by git:
 
-```json
-{
-  "server_url": "https://immich.example.com",
-  "api_key": "…",
-  "backup_root": "D:/Immich Backups"
-}
-```
+- **`config.json` in the repo root** holds the settings every immich-utils script shares. Copy the root `config.example.json`:
 
-You can also use environment variables (`IMMICH_URL`, `IMMICH_API_KEY`, `IMMICH_BACKUP_ROOT`) or command-line flags (`--server-url`, `--api-key`, `--backup-root`). Flags override environment variables, and environment variables override the file.
+  ```json
+  {
+    "server_url": "https://immich.example.com",
+    "api_key": "…"
+  }
+  ```
+
+- **`config.json` in this folder** holds settings only this script uses. Copy this folder's `config.example.json`:
+
+  ```json
+  {
+    "backup_root": "D:/Immich Backups"
+  }
+  ```
+
+This folder's file can also override the shared settings, so an older `config.json` that has all three settings still works. If you use one API key for several scripts, give it the permissions every one of those scripts needs.
+
+You can also use environment variables (`IMMICH_URL`, `IMMICH_API_KEY`, `IMMICH_BACKUP_ROOT`) or command-line flags (`--server-url`, `--api-key`, `--backup-root`). Flags override environment variables, environment variables override this folder's file, and this folder's file overrides the shared one.
 
 ### 4. Check access, then run
 

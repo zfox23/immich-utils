@@ -7,12 +7,13 @@ assets (Live Photo videos) are readable by id.
 
 import base64
 import hashlib
-import json
 import re
-import threading
+import sys
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root, for the shared package
+from shared.testing import FakeServer  # noqa: E402
 
 API_KEY = "test-key"
 
@@ -21,15 +22,14 @@ def new_id() -> str:
     return str(uuid.uuid4())
 
 
-class FakeImmich:
+class FakeImmich(FakeServer):
     def __init__(self):
+        super().__init__()
         self.me = {"id": new_id(), "name": "Admin", "email": "admin@example.com"}
         self.users = {self.me["id"]: dict(self.me, deletedAt=None, quotaUsageInBytes=0)}
         self.shared_with_me = set()  # user ids that share with me
         self.assets = {}
         self.fail_asset_ids = set()
-        self.requests = []
-        self.lock = threading.Lock()
 
     # --- setup helpers ---------------------------------------------------------------
     def add_user(self, name, share=True):
@@ -73,80 +73,48 @@ class FakeImmich:
         return a["ownerId"] in self.shared_with_me and not a["trashed"] and a["visibility"] in ("timeline", "hidden")
 
     # --- server ------------------------------------------------------------------------
-    def start(self):
-        fake = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-
-            def send_json(self, code, obj):
-                body = json.dumps(obj).encode()
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def do_GET(self):
-                u = urlparse(self.path)
-                q = {k: v[0] for k, v in parse_qs(u.query).items()}
-                with fake.lock:
-                    fake.requests.append(u.path)
-                if u.path == "/api/server/version":
-                    return self.send_json(200, {"major": 3, "minor": 4, "patch": 2})
-                if self.headers.get("x-api-key") != API_KEY:
-                    return self.send_json(401, {"message": "Invalid API key"})
-                if u.path == "/api/users/me":
-                    return self.send_json(200, fake.me)
-                if u.path == "/api/admin/users":
-                    return self.send_json(200, list(fake.users.values()))
-                if u.path == "/api/partners":
-                    return self.send_json(200, [
-                        {"id": uid, "name": fake.users[uid]["name"], "email": fake.users[uid]["email"]}
-                        for uid in fake.shared_with_me
-                    ])
-                if u.path.startswith("/api/timeline/"):
-                    uid = q.get("userId")
-                    if uid != fake.me["id"] and uid not in fake.shared_with_me:
-                        return self.send_json(400, {"message": "Not found or no timeline.read access"})
-                    assets = [a for a in fake.assets.values() if a["ownerId"] == uid and a["visibility"] == "timeline" and not a["trashed"]]
-                    if u.path == "/api/timeline/buckets":
-                        months = {}
-                        for a in assets:
-                            key = a["fileCreatedAt"][:7] + "-01"
-                            months[key] = months.get(key, 0) + 1
-                        return self.send_json(200, [{"timeBucket": k, "count": v} for k, v in sorted(months.items())])
-                    if u.path == "/api/timeline/bucket":
-                        tb = q["timeBucket"][:7]
-                        sel = [a for a in assets if a["fileCreatedAt"][:7] == tb]
-                        return self.send_json(200, {
-                            "id": [a["id"] for a in sel], "ownerId": [a["ownerId"] for a in sel],
-                            "isTrashed": [False for _ in sel], "livePhotoVideoId": [a["livePhotoVideoId"] for a in sel],
-                        })
-                m = re.match(r"^/api/assets/([0-9a-f-]{36})(/original)?$", u.path)
-                if m:
-                    a = fake.assets.get(m.group(1))
-                    if a is None or not fake.can_read_asset(a):
-                        return self.send_json(400, {"message": "Not found or no asset.read access"})
-                    if m.group(1) in fake.fail_asset_ids:
-                        return self.send_json(500, {"message": "boom"})
-                    if m.group(2):
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/octet-stream")
-                        self.send_header("Content-Length", str(len(a["content"])))
-                        self.end_headers()
-                        self.wfile.write(a["content"])
-                        return
-                    return self.send_json(200, fake.detail(a))
-                return self.send_json(404, {"message": "no route"})
-
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
-        self.thread.start()
-        return self
-
-    def stop(self):
-        self.httpd.shutdown()
-        self.httpd.server_close()
+    def handle(self, method, path, q, body, api_key):
+        if method != "GET":
+            return 404, {"message": "no route"}
+        if path == "/api/server/version":
+            return 200, {"major": 3, "minor": 4, "patch": 2}
+        if api_key != API_KEY:
+            return 401, {"message": "Invalid API key"}
+        if path == "/api/users/me":
+            return 200, self.me
+        if path == "/api/admin/users":
+            return 200, list(self.users.values())
+        if path == "/api/partners":
+            return 200, [
+                {"id": uid, "name": self.users[uid]["name"], "email": self.users[uid]["email"]}
+                for uid in self.shared_with_me
+            ]
+        if path.startswith("/api/timeline/"):
+            uid = q.get("userId")
+            if uid != self.me["id"] and uid not in self.shared_with_me:
+                return 400, {"message": "Not found or no timeline.read access"}
+            assets = [a for a in self.assets.values() if a["ownerId"] == uid and a["visibility"] == "timeline" and not a["trashed"]]
+            if path == "/api/timeline/buckets":
+                months = {}
+                for a in assets:
+                    key = a["fileCreatedAt"][:7] + "-01"
+                    months[key] = months.get(key, 0) + 1
+                return 200, [{"timeBucket": k, "count": v} for k, v in sorted(months.items())]
+            if path == "/api/timeline/bucket":
+                tb = q["timeBucket"][:7]
+                sel = [a for a in assets if a["fileCreatedAt"][:7] == tb]
+                return 200, {
+                    "id": [a["id"] for a in sel], "ownerId": [a["ownerId"] for a in sel],
+                    "isTrashed": [False for _ in sel], "livePhotoVideoId": [a["livePhotoVideoId"] for a in sel],
+                }
+        m = re.match(r"^/api/assets/([0-9a-f-]{36})(/original)?$", path)
+        if m:
+            a = self.assets.get(m.group(1))
+            if a is None or not self.can_read_asset(a):
+                return 400, {"message": "Not found or no asset.read access"}
+            if m.group(1) in self.fail_asset_ids:
+                return 500, {"message": "boom"}
+            if m.group(2):
+                return 200, a["content"]
+            return 200, self.detail(a)
+        return 404, {"message": "no route"}

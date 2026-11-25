@@ -14,12 +14,17 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
 import backup_immich_users as b  # noqa: E402
+from shared import config as shared_config  # noqa: E402
+from shared import immich_client  # noqa: E402
 from fake_immich import API_KEY, FakeImmich  # noqa: E402
 
 
 class EndToEnd(unittest.TestCase):
     def setUp(self):
-        b.RETRY_BASE_DELAY = 0.01
+        immich_client.RETRY_BASE_DELAY = 0.01
+        root_patch = mock.patch.object(shared_config, "ROOT_CONFIG", Path(tempfile.gettempdir()) / "no-such-immich-root-config.json")
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
         self.fake = FakeImmich().start()
         self.tmp = Path(tempfile.mkdtemp(prefix="immich-backup-test-"))
         self.root = self.tmp / "backup"
@@ -83,9 +88,9 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("Carol", log)  # warned: not sharing
 
         # Second run downloads nothing.
-        originals_before = sum(1 for r in f.requests if r.endswith("/original"))
+        originals_before = sum(1 for _, r in f.requests if r.endswith("/original"))
         self.assertEqual(self.run_backup("--non-interactive"), 0)
-        self.assertEqual(sum(1 for r in f.requests if r.endswith("/original")), originals_before)
+        self.assertEqual(sum(1 for _, r in f.requests if r.endswith("/original")), originals_before)
 
         # Date edit -> move; changed original -> replace (old kept); new asset; deletion -> kept.
         f.assets[self.b1]["localDateTime"] = "2025-01-01T00:01:00.000Z"
@@ -143,11 +148,11 @@ class EndToEnd(unittest.TestCase):
         state = self.root / ".immich-backup"
         (state / "manifest.json").unlink()
         (state / "manifest.json.bak").unlink(missing_ok=True)
-        originals_before = sum(1 for r in self.fake.requests if r.endswith("/original"))
+        originals_before = sum(1 for _, r in self.fake.requests if r.endswith("/original"))
         self.assertEqual(self.run_backup("--non-interactive"), 0)
         self.assertEqual(self.files(), before | {"Jane Doe/2022/2022-02-02/LIBRARY_%s.JPG" % self.jlib[:8]})
         # Only the external-library asset (path checksum, can't be verified) is downloaded again.
-        self.assertEqual(sum(1 for r in self.fake.requests if r.endswith("/original")) - originals_before, 1)
+        self.assertEqual(sum(1 for _, r in self.fake.requests if r.endswith("/original")) - originals_before, 1)
 
     def test_local_file_deleted_is_restored(self):
         self.assertEqual(self.run_backup("--non-interactive"), 0)
